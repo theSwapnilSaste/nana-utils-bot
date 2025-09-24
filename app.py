@@ -1,10 +1,23 @@
-from flask import Flask, request, jsonify
-import requests, sqlite3, json, os, datetime
+import os
+import requests
+import sqlite3
+import json
+import datetime
+from telegram import Update
+from telegram.ext import Updater, CommandHandler, CallbackContext
 
-app = Flask(__name__)
+# -------------------- CONFIG --------------------
+BOT_TOKEN = os.environ.get("VERIFIER_BOT_TOKEN")
+OWNER_ID = os.environ.get("OWNER_ID")
+
+if not BOT_TOKEN or not OWNER_ID:
+    raise Exception("Missing BOT_TOKEN or OWNER_ID environment variables")
+
+OWNER_ID = int(OWNER_ID)
 DB_FILE = "history.db"
-SECRET_KEY = os.environ.get("VERIFIER_SECRET", "changeme")  # set in environment
+# ------------------------------------------------
 
+# Initialize database
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
@@ -20,71 +33,80 @@ def init_db():
     conn.commit()
     conn.close()
 
+# Log verification to DB
 def log_verification(token, status, result):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-    masked = token[:5] + "..." + token[-5:]  # mask token for safety
-    cur.execute("INSERT INTO verifications (token_checked, status, result_json, timestamp) VALUES (?,?,?,?)",
-                (masked, status, json.dumps(result), datetime.datetime.utcnow().isoformat()))
+    masked = token[:5] + "..." + token[-5:]  # mask token
+    cur.execute(
+        "INSERT INTO verifications (token_checked, status, result_json, timestamp) VALUES (?,?,?,?)",
+        (masked, status, json.dumps(result), datetime.datetime.utcnow().isoformat())
+    )
     conn.commit()
     conn.close()
 
-@app.route("/verify", methods=["GET"])
-def verify():
-    # --- Auth ---
-    key = request.args.get("key")
-    if key != SECRET_KEY:
-        return jsonify({"error": "Unauthorized"}), 403
+# -------------------- BOT COMMANDS --------------------
+def verify_command(update: Update, context: CallbackContext):
+    if update.effective_user.id != OWNER_ID:
+        update.message.reply_text("Unauthorized.")
+        return
 
-    # --- Params ---
-    token = request.args.get("token")
-    fetch_updates = request.args.get("updates", "false").lower() == "true"
-    if not token:
-        return jsonify({"error": "Missing token"}), 400
+    if len(context.args) == 0:
+        update.message.reply_text("Usage: /verify <bot_token>")
+        return
 
+    token = context.args[0]
     base_url = f"https://api.telegram.org/bot{token}"
-    resp_me = requests.get(f"{base_url}/getMe").json()
+
+    try:
+        resp_me = requests.get(f"{base_url}/getMe", timeout=10).json()
+    except Exception as e:
+        update.message.reply_text(f"Error: {e}")
+        return
 
     if not resp_me.get("ok"):
         result = {"status": "invalid", "error": resp_me.get("description")}
         log_verification(token, "invalid", result)
-        return jsonify(result)
+        update.message.reply_text(f"❌ Invalid token:\n{json.dumps(result, indent=2)}")
+        return
 
     result = {"status": "valid", "bot_info": resp_me["result"]}
 
-    if fetch_updates:
-        resp_updates = requests.get(f"{base_url}/getUpdates").json()
+    try:
+        resp_updates = requests.get(f"{base_url}/getUpdates", timeout=10).json()
         result["updates"] = resp_updates if resp_updates.get("ok") else {"status": "no updates"}
+    except:
+        result["updates"] = {"status": "no updates"}
 
-    # log result
     log_verification(token, "valid", result)
-    return jsonify(result)
+    update.message.reply_text(f"✅ Token is valid:\n{json.dumps(result, indent=2)}")
 
-@app.route("/history", methods=["GET"])
-def history():
-    # --- Auth ---
-    key = request.args.get("key")
-    if key != SECRET_KEY:
-        return jsonify({"error": "Unauthorized"}), 403
+def history_command(update: Update, context: CallbackContext):
+    if update.effective_user.id != OWNER_ID:
+        update.message.reply_text("Unauthorized.")
+        return
 
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-    cur.execute("SELECT id, token_checked, status, result_json, timestamp FROM verifications ORDER BY id DESC LIMIT 20")
+    cur.execute("SELECT id, token_checked, status, result_json, timestamp FROM verifications ORDER BY id DESC LIMIT 10")
     rows = cur.fetchall()
     conn.close()
 
-    history = []
+    messages = []
     for row in rows:
-        history.append({
-            "id": row[0],
-            "token_checked": row[1],
-            "status": row[2],
-            "result_json": json.loads(row[3]),
-            "timestamp": row[4]
-        })
+        messages.append(f"ID: {row[0]}\nToken: {row[1]}\nStatus: {row[2]}\nTime: {row[4]}")
 
-    return jsonify(history)
+    update.message.reply_text("\n\n".join(messages) if messages else "No history.")
 
+# -------------------- MAIN --------------------
 if __name__ == "__main__":
     init_db()
-    app.run(host="0.0.0.0", port=8080)
+    updater = Updater(BOT_TOKEN)
+    dp = updater.dispatcher
+
+    dp.add_handler(CommandHandler("verify", verify_command))
+    dp.add_handler(CommandHandler("history", history_command))
+
+    print("🔹 Nana Utils Bot started. Listening for commands...")
+    updater.start_polling()
+    updater.idle()
